@@ -1,127 +1,150 @@
-"""Finite-ranger contention experiment on top of the unmodified dzanga_sim.py.
+"""What does ONE ranger do when two poaching incidents happen at the same time?
 
-Baseline sim: every detected poacher gets its own ranger (unlimited).
-Exploratory script; dzanga_sim.py is NOT modified.
-Here: R rangers stationed round-robin across the 5 towns. Detected poachers
-join an incident queue; a free ranger is assigned by POLICY:
-  fifo    - oldest incident first (order received), nearest free ranger takes it
-  nearest - globally closest (free ranger, incident) pair first
-A ranger stays where it caught its poacher and is free again immediately.
+Exploratory script. dzanga_sim.py is NOT modified, and no dispatch rule is added.
+
+The baseline sim has unlimited rangers: every detected poacher gets its own
+ranger from the nearest town, so incidents never compete. Here the only change
+is a limit of N rangers (default 1), starting at the first town(s). When the
+ranger is busy, newly detected poachers wait. When it becomes free it takes the
+next incident in the order the sim itself flagged them (_scan_mics loop order).
+That ordering is the sim's own; nothing else decides.
+
+Logged per tie (2+ incidents waiting when the ranger becomes free): which
+poacher the ranger took, which were left waiting, distances from the ranger,
+and what happened to the ones left waiting.
 """
-import argparse, csv, itertools, time
+import argparse, csv, os, time
 from multiprocessing import Pool
 import dzanga_sim as ds
 from dzanga_sim import m2px, norm2, safe_unit
 
+KM_PER_PX = ds.METERS_PER_PIXEL / 1000.0
 
-class LimitedRangerSim(ds.DzangaSimulation):
-    def setup(self, n_rangers, policy):
-        self.policy = policy
+
+class OneRangerSim(ds.DzangaSimulation):
+    def setup(self, n_rangers):
         towns = self.repulsors
         self.rangers = [dict(x=towns[i % len(towns)].x, y=towns[i % len(towns)].y, task=None)
                         for i in range(n_rangers)]
-        self.queue = []          # (time_detected, poacher_index)
-        self.queued = set()
-        self.waits = []          # detection -> ranger assigned (s)
-        self.contention_steps = 0  # steps with a waiting incident and no free ranger
-        self.max_queue = 0
-        self.tie_events = 0      # steps where >=2 incidents waited for 1 free ranger
+        self.queue = []                 # poacher indices, in the order the sim flagged them
+        self.seen = set()
+        self.detect_t, self.assign_t = {}, {}
+        self.kills = {}                 # poacher index -> elephants poached
+        self.ties = []
 
     def _scan_mics(self):
-        super()._scan_mics()     # baseline detection/alert logic sets p.is_targeted
+        super()._scan_mics()            # baseline detection/alert logic, unchanged
         for i, p in enumerate(self.poachers):
-            if p.is_targeted and not p.is_caught and i not in self.queued:
-                self.queued.add(i)
-                self.queue.append((self.current_sim_time, i))
-
-    def _assign(self):
-        free = [r for r in self.rangers if r['task'] is None]
-        waiting = [q for q in self.queue if not self.poachers[q[1]].is_caught]
-        self.queue = waiting
-        if len(waiting) >= 2 and len(free) == 1:
-            self.tie_events += 1
-        while free and self.queue:
-            if self.policy == 'fifo':
-                t0, i = min(self.queue)
-                p = self.poachers[i]
-                r = min(free, key=lambda r: norm2(r['x'] - p.x, r['y'] - p.y))
-            else:  # nearest pair
-                (t0, i), r = min(itertools.product(self.queue, free),
-                                 key=lambda qr: norm2(qr[1]['x'] - self.poachers[qr[0][1]].x,
-                                                      qr[1]['y'] - self.poachers[qr[0][1]].y))
-            r['task'] = i
-            self.waits.append(self.current_sim_time - t0)
-            self.queue.remove((t0, i)); free.remove(r)
-        if self.queue:
-            self.contention_steps += 1
-            self.max_queue = max(self.max_queue, len(self.queue))
+            if p.is_targeted and not p.is_caught and i not in self.seen:
+                self.seen.add(i)
+                self.queue.append(i)
+                self.detect_t[i] = self.current_sim_time
 
     def _move_rangers(self, step_r):
-        self._assign()
+        self.queue = [i for i in self.queue if not self.poachers[i].is_caught]
+        for r in self.rangers:
+            if r['task'] is None and self.queue:
+                i = self.queue.pop(0)   # next in the sim's own detection order
+                if self.queue:          # a tie: others are still waiting
+                    d = lambda j: round(norm2(self.poachers[j].x - r['x'],
+                                              self.poachers[j].y - r['y']) * KM_PER_PX, 1)
+                    self.ties.append(dict(t_h=round(self.current_sim_time / 3600, 2),
+                                          chose=i, chose_km=d(i),
+                                          waiting=list(self.queue),
+                                          waiting_km=[d(j) for j in self.queue]))
+                r['task'] = i
+                self.assign_t[i] = self.current_sim_time
         for r in self.rangers:
             if r['task'] is None:
                 continue
             p = self.poachers[r['task']]
             if p.is_caught:
-                r['task'] = None; continue
+                r['task'] = None
+                continue
+            p.ranger_x, p.ranger_y = r['x'], r['y']
             dx, dy = p.x - r['x'], p.y - r['y']
             if norm2(dx, dy) < m2px(500):
-                p.is_caught = True; p.caught_time = self.current_sim_time
+                p.is_caught = True
+                p.caught_time = self.current_sim_time
                 r['task'] = None
             else:
                 ux, uy = safe_unit(dx, dy)
-                r['x'] += ux * step_r; r['y'] += uy * step_r
-        for r in self.rangers:          # keep GUI fields roughly sensible
-            if r['task'] is not None:
-                self.poachers[r['task']].ranger_x = r['x']; self.poachers[r['task']].ranger_y = r['y']
+                r['x'] += ux * step_r
+                r['y'] += uy * step_r
+
+    def _poaching_check(self):
+        before = {k for k, e in enumerate(self.elephants) if e.is_poached}
+        events = super()._poaching_check()      # baseline poaching logic, unchanged
+        for k, e in enumerate(self.elephants):
+            if e.is_poached and k not in before:  # attribute to the nearest free poacher
+                j = min((j for j, p in enumerate(self.poachers) if not p.is_caught),
+                        key=lambda j: norm2(self.poachers[j].x - e.x, self.poachers[j].y - e.y))
+                self.kills[j] = self.kills.get(j, 0) + 1
+        return events
 
 
 def run(args):
-    n_poachers, n_rangers, policy, seed, sim_days, dt = args
+    n_poachers, n_rangers, seed, days, dt = args
     ds.NUM_POACHERS = n_poachers
-    sim = LimitedRangerSim(mic_strategy=1, num_mics=80, seed=seed)
-    sim.setup(n_rangers, policy)
-    T = sim_days * 86400
+    sim = OneRangerSim(mic_strategy=1, num_mics=80, seed=seed)
+    sim.setup(n_rangers)
+    T = days * 86400
     while (sim.current_sim_time < T and sim.caught_count < len(sim.poachers)
            and sim.poached_count < len(sim.elephants)):
         sim.step(dt, 1.0)
-    w = sim.waits
-    return dict(poachers=n_poachers, rangers=n_rangers, policy=policy, seed=seed,
-                poached=sim.poached_count, caught=sim.caught_count,
-                detected=len(sim.queued), mean_wait_h=round(sum(w) / len(w) / 3600, 2) if w else 0,
-                max_queue=sim.max_queue, tie_events=sim.tie_events,
-                sim_days=round(sim.current_sim_time / 86400, 2))
+    for tie in sim.ties:                # what happened to the ones left waiting
+        tie['waiting_caught'] = sum(sim.poachers[j].is_caught for j in tie['waiting'])
+        tie['waiting_kills_total'] = sum(sim.kills.get(j, 0) for j in tie['waiting'])
+        tie.update(poachers=n_poachers, rangers=n_rangers, seed=seed)
+    waits = [sim.assign_t[i] - sim.detect_t[i] for i in sim.assign_t]
+    summary = dict(poachers=n_poachers, rangers=n_rangers, seed=seed,
+                   poached=sim.poached_count, caught=sim.caught_count, detected=len(sim.seen),
+                   never_reached=len(sim.seen) - len(sim.assign_t),
+                   ties=len(sim.ties),
+                   mean_wait_h=round(sum(waits) / len(waits) / 3600, 2) if waits else 0.0,
+                   kills_by_detected=sum(sim.kills.get(i, 0) for i in sim.seen),
+                   kills_by_undetected=sum(v for i, v in sim.kills.items() if i not in sim.seen))
+    return summary, sim.ties
+
+
+def write(path, rows):
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--poachers', default='30,100', help='comma list of poacher counts')
-    ap.add_argument('--rangers', default='1,3', help='comma list of ranger counts')
-    ap.add_argument('--policies', default='fifo,nearest')
+    ap.add_argument('--rangers', type=int, default=1)
     ap.add_argument('--seeds', type=int, default=2)
     ap.add_argument('--days', type=float, default=1.0, help='sim-days per run')
     ap.add_argument('--dt', type=float, default=10.0, help='sim-seconds per step (README uses 1 for paper runs)')
     ap.add_argument('--workers', type=int, default=2)
-    ap.add_argument('--csv', default='results/ranger_contention.csv')
+    ap.add_argument('--out', default='results/one_ranger')
     a = ap.parse_args()
-    jobs = [(P, R, pol, s, a.days, a.dt)
-            for P in map(int, a.poachers.split(',')) for R in map(int, a.rangers.split(','))
-            for pol in a.policies.split(',') for s in range(a.seeds)]
+    jobs = [(P, a.rangers, s, a.days, a.dt) for P in map(int, a.poachers.split(',')) for s in range(a.seeds)]
     t = time.time()
     with Pool(a.workers) as pool:
-        rows = pool.map(run, jobs)
-    import os; os.makedirs(os.path.dirname(a.csv) or '.', exist_ok=True)
-    with open(a.csv, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=rows[0].keys()); w.writeheader(); w.writerows(rows)
-    print(f'{len(rows)} runs in {time.time()-t:.0f}s -> {a.csv}\n')
-    groups = {}
-    for r in rows:
-        groups.setdefault((r['poachers'], r['rangers'], r['policy']), []).append(r)
-    cols = ['poached', 'caught', 'detected', 'mean_wait_h', 'max_queue', 'tie_events']
-    print(f"{'P':>5}{'R':>4} {'policy':8}" + ''.join(f'{c:>12}' for c in cols))
-    for k in sorted(groups):
-        v = groups[k]
-        print(f'{k[0]:>5}{k[1]:>4} {k[2]:8}' + ''.join(f'{sum(x[c] for x in v)/len(v):>12.2f}' for c in cols))
+        out = pool.map(run, jobs)
+    summaries = [s for s, _ in out]
+    ties = [x for _, tl in out for x in tl]
+    write(a.out + '_summary.csv', summaries)
+    write(a.out + '_ties.csv', ties)
+    print(f'{len(jobs)} runs in {time.time()-t:.0f}s -> {a.out}_summary.csv, {a.out}_ties.csv\n')
+    cols = list(summaries[0].keys())[3:]
+    print(f"{'P':>5}{'R':>3}{'seed':>5}" + ''.join(f'{c:>20}' for c in cols))
+    for s in summaries:
+        print(f"{s['poachers']:>5}{s['rangers']:>3}{s['seed']:>5}" + ''.join(f'{s[c]:>20}' for c in cols))
+    print(f'\nTies (ranger free, 2+ incidents waiting): {len(ties)}')
+    for x in ties[:10]:
+        print(f"  P={x['poachers']} seed={x['seed']} t={x['t_h']}h: took poacher {x['chose']} "
+              f"({x['chose_km']} km away); left waiting {x['waiting']} at {x['waiting_km']} km "
+              f"-> {x['waiting_caught']} of them caught later, {x['waiting_kills_total']} elephants killed by them")
 
 
 if __name__ == '__main__':
